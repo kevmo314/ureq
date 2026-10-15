@@ -10,6 +10,12 @@ use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Result as IoResult;
 
+// 16 hex digits fill a u64, leave some room for leading zeros and padding.
+const MAX_CHUNK_SIZE_LEN: usize = 32;
+
+// Chunk extensions are ignored, but must still end within a sane distance.
+const MAX_CHUNK_EXT_LEN: usize = 4096;
+
 /// Reads HTTP chunks and sends back real data.
 ///
 /// # Example
@@ -52,7 +58,7 @@ where
     }
 
     fn read_chunk_size(&mut self) -> IoResult<usize> {
-        let mut chunk_size_bytes = Vec::new();
+        let mut chunk_size_bytes = Vec::with_capacity(MAX_CHUNK_SIZE_LEN);
         let mut has_ext = false;
 
         loop {
@@ -70,11 +76,16 @@ where
                 break;
             }
 
+            if chunk_size_bytes.len() >= MAX_CHUNK_SIZE_LEN {
+                return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
+            }
+
             chunk_size_bytes.push(byte);
         }
 
         // Ignore extensions for now
         if has_ext {
+            let mut ext_len = 0;
             loop {
                 let byte = match self.source.by_ref().bytes().next() {
                     Some(b) => b?,
@@ -82,6 +93,10 @@ where
                 };
                 if byte == b'\r' {
                     break;
+                }
+                ext_len += 1;
+                if ext_len > MAX_CHUNK_EXT_LEN {
+                    return Err(IoError::new(ErrorKind::InvalidInput, DecoderError));
                 }
             }
         }
@@ -259,6 +274,19 @@ mod test {
         read_err("1 invalid extension\r\n");
         read_err("1 A\r\n");
         read_err("1;no CRLF");
+    }
+
+    #[test]
+    fn test_read_chunk_size_line_too_long() {
+        // An endless chunk size must error instead of buffering forever.
+        let mut decoded = Decoder::new(io::repeat(b'1'));
+        let err_kind = decoded.read_chunk_size().unwrap_err().kind();
+        assert_eq!(err_kind, io::ErrorKind::InvalidInput);
+
+        // Same for an endless extension.
+        let mut decoded = Decoder::new(b"1;".chain(io::repeat(b'a')));
+        let err_kind = decoded.read_chunk_size().unwrap_err().kind();
+        assert_eq!(err_kind, io::ErrorKind::InvalidInput);
     }
 
     #[test]
